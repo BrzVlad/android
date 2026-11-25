@@ -58,12 +58,21 @@ namespace xamarin::android {
 			return mark_cross_references;
 		}
 
+#if !defined (XA_HOST_NATIVEAOT)
+		static auto get_pending_args () noexcept -> MarkCrossReferencesArgs*;
+		static void clear_pending_args (MarkCrossReferencesArgs *args) noexcept;
+#endif
+
 	private:
 		static inline sem_t shared_args_semaphore {};
 		// JavaMarshal serializes bridge rounds: it does not publish another argument block until
 		// FinishCrossReferenceProcessing has completed. This is therefore a single-slot handoff;
 		// the semaphore signals availability but does not queue distinct argument blocks.
 		static inline MarkCrossReferencesArgs *shared_args = nullptr;
+#if !defined (XA_HOST_NATIVEAOT)
+		// Remains published until the managed worker completes the corresponding bridge round.
+		static inline MarkCrossReferencesArgs *pending_args = nullptr;
+#endif
 		static inline BridgeProcessingFtn bridge_processing_callback = nullptr;
 		static inline bool initialized {};
 

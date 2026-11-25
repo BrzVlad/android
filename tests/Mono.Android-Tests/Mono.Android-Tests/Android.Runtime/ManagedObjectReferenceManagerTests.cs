@@ -100,6 +100,38 @@ namespace Xamarin.Android.RuntimeTests {
 		}
 
 		[TestMethod]
+		public void NestedBridgeReferenceOperationsRestoreOuterOperation ()
+		{
+			using var peer = new Java.Lang.String ("nested bridge operations");
+			using var listener = new ReferenceListener (RuntimeEventSource.GlobalReferenceKeyword);
+			var manager = new ManagedObjectReferenceManager ();
+			JniObjectReference global = default, weak = default;
+			var previous = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
+			try {
+				var inner = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
+				try {
+					global = manager.CreateGlobalReference (peer.PeerReference);
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (inner);
+				}
+				weak = manager.CreateWeakGlobalReference (global);
+			} finally {
+				try {
+					manager.DeleteWeakGlobalReference (ref weak);
+					manager.DeleteGlobalReference (ref global);
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previous);
+				}
+			}
+
+			var events = listener.GetEvents ().Where (e => e.ThreadId == Environment.CurrentManagedThreadId).ToArray ();
+			Assert.AreEqual ((int)GCBridgeReferenceOperation.WeakToGlobal,
+				events.Single (e => e.Id == RuntimeEventSource.GlobalReferenceCreatedEventId).Payload [7]);
+			Assert.AreEqual ((int)GCBridgeReferenceOperation.GlobalToWeak,
+				events.Single (e => e.Id == RuntimeEventSource.WeakGlobalReferenceCreatedEventId).Payload [7]);
+		}
+
+		[TestMethod]
 		public void InitializesGrefLimitsFromHost ()
 		{
 			int previousThreshold = JNIEnvInit.gref_gc_threshold;

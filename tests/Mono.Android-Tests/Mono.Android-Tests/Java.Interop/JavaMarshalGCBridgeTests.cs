@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.Tracing;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -39,6 +40,10 @@ public class JavaMarshalGCBridgeTests
 
 	[UnsafeAccessor (UnsafeAccessorKind.StaticMethod, Name = "get_BridgeJni")]
 	static extern JavaMarshalGCBridgeJni GetBridgeJni (
+		[UnsafeAccessorType ("Microsoft.Android.Runtime.JavaMarshalGCBridge, Mono.Android")] object target);
+
+	[UnsafeAccessor (UnsafeAccessorKind.StaticMethod, Name = "GetPendingBridgeArgs")]
+	static extern IntPtr GetPendingBridgeArgs (
 		[UnsafeAccessorType ("Microsoft.Android.Runtime.JavaMarshalGCBridge, Mono.Android")] object target);
 
 	[TestMethod]
@@ -159,7 +164,7 @@ public class JavaMarshalGCBridgeTests
 		using var listener = new ManagedObjectReferenceManagerTests.ReferenceListener (RuntimeEventSource.GlobalReferenceKeyword);
 		var roots = new JavaObjectArray<Java.Lang.Object> (1);
 		try {
-			CreatePeerCycle (roots, out first, out second, out ulong firstHandle, out ulong secondHandle);
+			CreatePeerCycle (roots, out first, out second, out ulong firstHandle, out ulong secondHandle, out _, out _);
 			await GCBridgeTestHelpers.WaitForBridgeRoundsAsync (testContext.CancellationToken);
 
 			Assert.IsTrue (first.TryGetTarget (out _) && second.TryGetTarget (out _),
@@ -174,9 +179,94 @@ public class JavaMarshalGCBridgeTests
 			"Both peers should be collected after releasing the Java root.");
 	}
 
+	[TestMethod]
+	[Timeout (60_000, CooperativeCancellation = true)]
+	[TestCategory ("GCBridge")]
+	public void AcquisitionRequiresAnActuallyStrongJniReference ()
+	{
+		if (!Microsoft.Android.Runtime.RuntimeFeature.IsCoreClrRuntime)
+			Assert.Inconclusive ("This acquisition path is specific to the CoreCLR bridge.");
+
+		using var peer = new BridgeCyclePeer ();
+		JniObjectReference weak = peer.PeerReference.NewWeakGlobalRef ();
+		try {
+			var mislabeledWeak = new JniObjectReference (weak.Handle, JniObjectReferenceType.Local);
+			Assert.IsNull (JniEnvironment.Runtime.ValueManager.PeekPeer (mislabeledWeak));
+			Assert.AreSame (peer, JniEnvironment.Runtime.ValueManager.PeekPeer (peer.PeerReference));
+			Assert.AreSame (peer, JniEnvironment.Runtime.ValueManager.PeekPeer (weak));
+		} finally {
+			JniObjectReference.Dispose (ref weak);
+		}
+	}
+
+	[TestMethod]
+	[Timeout (60_000, CooperativeCancellation = true)]
+	[TestCategory ("GCBridge")]
+	[DoNotParallelize]
+	public async Task StrongJniReferenceAcquiresPeerBeforeBridgePreparation ()
+	{
+		if (!Microsoft.Android.Runtime.RuntimeFeature.IsCoreClrRuntime)
+			Assert.Inconclusive ("This acquisition path is specific to the CoreCLR bridge.");
+
+		await GCBridgeTestHelpers.WaitForBridgeRoundsAsync (testContext.CancellationToken);
+		var roots = new JavaObjectArray<Java.Lang.Object> (1);
+		WeakReference<BridgeCyclePeer> first;
+		WeakReference<BridgeCyclePeer> second;
+		try {
+			CreatePeerCycle (roots, out first, out second, out _, out _, out int firstIdentity, out int secondIdentity);
+			using var started = new ManualResetEventSlim ();
+			using var resume = new ManualResetEventSlim ();
+			using var stopped = new ManualResetEventSlim ();
+			using var pauseListener = new PausingBridgeListener (started, resume, stopped);
+			using var referenceListener = new ManagedObjectReferenceManagerTests.ReferenceListener (RuntimeEventSource.GlobalReferenceKeyword);
+			pauseListener.Arm ();
+
+			try {
+				GC.Collect (generation: 2, mode: GCCollectionMode.Forced, blocking: true);
+				Assert.IsTrue (started.Wait (TimeSpan.FromSeconds (10)), "The bridge did not start.");
+				ulong firstHandle = FindPendingPeerHandle (firstIdentity);
+				ulong secondHandle = FindPendingPeerHandle (secondIdentity);
+
+				Task<bool> lookup = Task.Run (() => {
+					var peer = roots [0] as BridgeCyclePeer;
+					return peer != null && ReferenceEquals (peer, peer.Next.Next);
+				});
+				bool completedBeforeBridge = await Task.WhenAny (lookup, Task.Delay (TimeSpan.FromSeconds (3), testContext.CancellationToken)) == lookup;
+				if (completedBeforeBridge)
+					roots [0] = null!;
+
+				resume.Set ();
+				bool originalPeerReturned = await lookup.WaitAsync (TimeSpan.FromSeconds (15), testContext.CancellationToken);
+				Assert.IsTrue (stopped.Wait (TimeSpan.FromSeconds (10)), "The bridge did not complete.");
+				Assert.IsTrue (completedBeforeBridge, "A lookup with a strong JNI reference waited for the pending bridge.");
+				Assert.IsTrue (originalPeerReturned, "The lookup must return the original managed peer and its cycle.");
+				Assert.IsTrue (first.TryGetTarget (out _) && second.TryGetTarget (out _),
+					"The acquired cycle should survive this bridge round after its Java root is removed.");
+
+				Assert.IsFalse (referenceListener.GetEvents ().Any (e =>
+					e.Id == RuntimeEventSource.WeakGlobalReferenceCreatedEventId &&
+					(Equals (e.Payload [0], firstHandle) || Equals (e.Payload [0], secondHandle)) &&
+					Equals (e.Payload [7], (int)GCBridgeReferenceOperation.GlobalToWeak)),
+					"The acquired SCC must not be weakened during this bridge round.");
+			} finally {
+				pauseListener.Disarm ();
+				resume.Set ();
+				if (started.IsSet)
+					Assert.IsTrue (stopped.Wait (TimeSpan.FromSeconds (10)), "The bridge did not complete after being resumed.");
+			}
+		} finally {
+			roots.Dispose ();
+		}
+
+		await GCBridgeTestHelpers.CollectUnreachablePeersAsync (testContext.CancellationToken);
+		Assert.IsFalse (first.TryGetTarget (out _) || second.TryGetTarget (out _),
+			"Acquisition must not keep the peers alive in later bridge rounds.");
+	}
+
 	[MethodImpl (MethodImplOptions.NoInlining)]
 	static void CreatePeerCycle (JavaObjectArray<Java.Lang.Object> roots,
-		out WeakReference<BridgeCyclePeer> first, out WeakReference<BridgeCyclePeer> second, out ulong firstHandle, out ulong secondHandle)
+		out WeakReference<BridgeCyclePeer> first, out WeakReference<BridgeCyclePeer> second,
+		out ulong firstHandle, out ulong secondHandle, out int firstIdentity, out int secondIdentity)
 	{
 		var a = new BridgeCyclePeer ();
 		var b = new BridgeCyclePeer ();
@@ -187,6 +277,76 @@ public class JavaMarshalGCBridgeTests
 		second = new WeakReference<BridgeCyclePeer> (b, trackResurrection: true);
 		firstHandle = unchecked((ulong)(nuint)a.PeerReference.Handle);
 		secondHandle = unchecked((ulong)(nuint)b.PeerReference.Handle);
+		firstIdentity = a.JniIdentityHashCode;
+		secondIdentity = b.JniIdentityHashCode;
+	}
+
+	static unsafe ulong FindPendingPeerHandle (int identity)
+	{
+		// SAFETY: the test pauses the bridge worker before preparation and keeps it paused
+		// throughout this read, so the CLR-owned descriptor and context arrays remain live.
+		var args = (MarkCrossReferencesArgs*)GetPendingBridgeArgs (null!);
+		Assert.IsTrue (args != null, "A bridge graph should already be published.");
+		for (nuint i = 0; i < args->ComponentCount; i++) {
+			StronglyConnectedComponent component = args->Components [i];
+			for (nuint j = 0; j < component.Count; j++) {
+				var context = (HandleContext*)component.Contexts [j];
+				if (context->PeerIdentityHashCode == identity)
+					return unchecked((ulong)(nuint)context->PeerReference.Handle);
+			}
+		}
+		Assert.Fail ($"Peer 0x{identity:x} was not included in the pending bridge graph.");
+		return 0;
+	}
+
+	sealed class PausingBridgeListener : EventListener
+	{
+		readonly ManualResetEventSlim started;
+		readonly ManualResetEventSlim resume;
+		readonly ManualResetEventSlim stopped;
+		readonly Lock gate = new ();
+		bool armed;
+
+		public PausingBridgeListener (ManualResetEventSlim started, ManualResetEventSlim resume, ManualResetEventSlim stopped)
+		{
+			this.started = started;
+			this.resume = resume;
+			this.stopped = stopped;
+			RuntimeEventSource.Initialize ();
+			foreach (EventSource source in EventSource.GetSources ()) {
+				if (source.Name == RuntimeEventSource.ProviderName)
+					EnableEvents (source, EventLevel.Informational, RuntimeEventSource.GCBridgeKeyword);
+			}
+		}
+
+		public void Arm ()
+		{
+			lock (gate)
+				armed = true;
+		}
+
+		public void Disarm ()
+		{
+			lock (gate)
+				armed = false;
+		}
+
+		protected override void OnEventWritten (EventWrittenEventArgs eventData)
+		{
+			if (eventData.EventId == RuntimeEventSource.GCBridgeStartEventId) {
+				bool pause;
+				lock (gate) {
+					pause = armed;
+					armed = false;
+					if (pause)
+						started.Set ();
+				}
+				if (pause)
+					resume.Wait ();
+			} else if (eventData.EventId == RuntimeEventSource.GCBridgeStopEventId && started.IsSet) {
+				stopped.Set ();
+			}
+		}
 	}
 
 	static void AssertCycleSurvivedJavaCollection (ManagedObjectReferenceManagerTests.ReferenceListener listener, params ulong [] globalHandles)

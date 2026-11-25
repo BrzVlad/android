@@ -35,14 +35,16 @@ namespace Android.Runtime {
 		public override bool LogGlobalReferenceMessages => RuntimeFeature.EventSourceSupport && RuntimeEventSource.GlobalReferenceEventsEnabled;
 		public override bool LogLocalReferenceMessages => RuntimeFeature.EventSourceSupport && RuntimeEventSource.LocalReferenceEventsEnabled;
 
-		internal static void BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation operation)
+		internal static GCBridgeReferenceOperation BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation operation)
 		{
+			GCBridgeReferenceOperation previous = gcBridgeReferenceOperation;
 			gcBridgeReferenceOperation = operation;
+			return previous;
 		}
 
-		internal static void EndGCBridgeReferenceOperation ()
+		internal static void EndGCBridgeReferenceOperation (GCBridgeReferenceOperation previous)
 		{
-			gcBridgeReferenceOperation = GCBridgeReferenceOperation.None;
+			gcBridgeReferenceOperation = previous;
 		}
 
 		public override JniObjectReference CreateLocalReference (JniObjectReference value, ref int localReferenceCount)

@@ -1,6 +1,8 @@
 #include <cerrno>
 #include <semaphore.h>
 
+#include <jni.h>
+
 #include <host/gc-bridge.hh>
 #include <shared/helpers.hh>
 
@@ -24,6 +26,12 @@ void GCBridge::start_bridge_processing_thread () noexcept
 
 void GCBridge::publish_shared_args (MarkCrossReferencesArgs *args) noexcept
 {
+#if !defined (XA_HOST_NATIVEAOT)
+	MarkCrossReferencesArgs *no_pending_args = nullptr;
+	bool pending_published = __atomic_compare_exchange_n (&pending_args, &no_pending_args, args, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+	abort_unless (pending_published, "A GC bridge argument block is already pending completion");
+#endif
+
 	MarkCrossReferencesArgs *expected = nullptr;
 	bool published = __atomic_compare_exchange_n (&shared_args, &expected, args, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 	abort_unless (published, "A GC bridge argument block is already pending");
@@ -31,6 +39,37 @@ void GCBridge::publish_shared_args (MarkCrossReferencesArgs *args) noexcept
 	int ret = sem_post (&shared_args_semaphore);
 	abort_unless (ret == 0, "Failed to release GC bridge semaphore");
 }
+
+#if !defined (XA_HOST_NATIVEAOT)
+auto GCBridge::get_pending_args () noexcept -> MarkCrossReferencesArgs*
+{
+	return __atomic_load_n (&pending_args, __ATOMIC_ACQUIRE);
+}
+
+void GCBridge::clear_pending_args (MarkCrossReferencesArgs *args) noexcept
+{
+	bool cleared = __atomic_compare_exchange_n (&pending_args, &args, nullptr, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+	abort_unless (cleared, "The completed GC bridge argument block is not pending");
+}
+
+extern "C" [[gnu::visibility("default")]]
+auto android_get_pending_gc_bridge_args () noexcept -> MarkCrossReferencesArgs*
+{
+	return GCBridge::get_pending_args ();
+}
+
+extern "C" [[gnu::visibility("default")]]
+void android_clear_pending_gc_bridge_args (MarkCrossReferencesArgs *args) noexcept
+{
+	GCBridge::clear_pending_args (args);
+}
+
+extern "C" [[gnu::visibility("default")]]
+int android_get_gc_bridge_reference_type (JNIEnv *env, jobject reference) noexcept
+{
+	return static_cast<int> (env->GetObjectRefType (reference));
+}
+#endif
 
 auto GCBridge::wait_for_shared_args () noexcept -> MarkCrossReferencesArgs*
 {

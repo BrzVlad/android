@@ -10,6 +10,7 @@ namespace Microsoft.Android.Runtime;
 internal struct HandleContext
 {
 	static readonly nuint Size = (nuint)Marshal.SizeOf<HandleContext> ();
+	internal static readonly object ReferenceTrackingHandlesLock = new ();
 	static readonly Dictionary<IntPtr, GCHandle> referenceTrackingHandles = new ();
 
 	// SAFETY: Scalar storage does not dereference controlBlock; access to its allocation remains separately guarded.
@@ -89,11 +90,30 @@ internal struct HandleContext
 
 	public static GCHandle GetAssociatedGCHandle (HandleContext* context)
 	{
-		lock (referenceTrackingHandles) {
+		lock (ReferenceTrackingHandlesLock) {
 			if (!referenceTrackingHandles.TryGetValue ((IntPtr) context, out GCHandle handle)) {
 				throw new InvalidOperationException ("Unknown reference tracking handle.");
 			}
 
+			return handle;
+		}
+	}
+
+	internal static IJavaPeerable? GetReferenceTrackingTarget (HandleContext* context)
+	{
+		lock (ReferenceTrackingHandlesLock) {
+			return referenceTrackingHandles.TryGetValue ((IntPtr) context, out GCHandle handle)
+				? handle.Target as IJavaPeerable
+				: null;
+		}
+	}
+
+	internal static GCHandle TakeAssociatedGCHandle (HandleContext* context)
+	{
+		lock (ReferenceTrackingHandlesLock) {
+			if (!referenceTrackingHandles.Remove ((IntPtr) context, out GCHandle handle)) {
+				throw new InvalidOperationException ("Unknown reference tracking handle.");
+			}
 			return handle;
 		}
 	}
@@ -106,7 +126,7 @@ internal struct HandleContext
 	{
 		unsafe {
 			// SAFETY: the CLR callback supplies component/context arrays for their stated counts; the registry lock checks identity only, not native bounds or allocation lifetime.
-			lock (referenceTrackingHandles) {
+			lock (ReferenceTrackingHandlesLock) {
 				for (nuint i = 0; i < mcr->ComponentCount; i++) {
 					StronglyConnectedComponent component = mcr->Components [i];
 					EnsureAllContextsInComponentAreOurs (component);
@@ -142,7 +162,7 @@ internal struct HandleContext
 			context->controlBlock = peer.JniObjectReferenceControlBlock;
 
 			GCHandle handle = JavaMarshal.CreateReferenceTrackingHandle (peer, context);
-			lock (referenceTrackingHandles) {
+			lock (ReferenceTrackingHandlesLock) {
 				referenceTrackingHandles [(IntPtr) context] = handle;
 			}
 
@@ -164,7 +184,7 @@ internal struct HandleContext
 				return;
 			}
 
-			lock (referenceTrackingHandles) {
+			lock (ReferenceTrackingHandlesLock) {
 				referenceTrackingHandles.Remove ((IntPtr)context);
 			}
 

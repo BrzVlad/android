@@ -27,25 +27,137 @@ namespace Microsoft.Android.Runtime;
 /// down: stopping the detached bridge-processing thread is not supported by the runtime.
 /// </para>
 /// </remarks>
-static class JavaMarshalGCBridge
+static partial class JavaMarshalGCBridge
 {
 	static readonly Lock initializeLock = new ();
 	static bool initialized;
 	static int bridgeProcessingGeneration;
 	static readonly Lazy<JavaMarshalGCBridgeJni> jni = new (CreateJni);
+	static readonly Dictionary<IntPtr, nuint> componentByContext = new ();
+	static readonly Dictionary<nuint, List<nuint>> componentDestinations = new ();
+	static readonly HashSet<IntPtr> retainedContexts = new ();
+	static readonly HashSet<IntPtr> contextsBeingPromoted = new ();
+	static IntPtr indexedArgs;
+
+	[LibraryImport ("libmonodroid.so", EntryPoint = "android_get_pending_gc_bridge_args")]
+	private static unsafe partial IntPtr GetPendingBridgeArgs ();
+
+	[LibraryImport ("libmonodroid.so", EntryPoint = "android_clear_pending_gc_bridge_args")]
+	private static unsafe partial void ClearPendingBridgeArgs (IntPtr args);
+
+	[LibraryImport ("libmonodroid.so", EntryPoint = "android_get_gc_bridge_reference_type")]
+	private static unsafe partial JniObjectReferenceType GetReferenceType (IntPtr env, IntPtr reference);
 
 	internal static int BridgeProcessingGeneration => Volatile.Read (ref bridgeProcessingGeneration);
 
 	static JavaMarshalGCBridgeJni BridgeJni
 		=> jni.Value;
 
+	/// <safety>
+	/// The registry must retain <paramref name="context"/> for the call, and <paramref name="reference"/>
+	/// must be a live strong JNI reference on the current thread.
+	/// </safety>
+	internal static unsafe IJavaPeerable? TryAcquirePeer (HandleContext* context, JniObjectReference reference)
+	{
+		unsafe {
+			// SAFETY: the registry retains the context and the caller retains the strong JNI reference;
+			// the shared lock protects the GCHandle, pending graph and peer reference transitions.
+			lock (HandleContext.ReferenceTrackingHandlesLock) {
+				JniObjectReferenceType actualType = GetReferenceType (JNIEnv.Handle, reference.Handle);
+				if (actualType != JniObjectReferenceType.Local && actualType != JniObjectReferenceType.Global)
+					return null;
+
+				IJavaPeerable? peer = HandleContext.GetReferenceTrackingTarget (context);
+				if (peer == null || !peer.PeerReference.IsValid ||
+						!JniEnvironment.Types.IsSameObject (reference, peer.PeerReference))
+					return null;
+
+				var args = (MarkCrossReferencesArgs*) GetPendingBridgeArgs ();
+				if (args != null && !retainedContexts.Contains ((IntPtr)context)) {
+					RetainReachableContexts (args, context, reference);
+				}
+				GC.KeepAlive (peer);
+				return peer;
+			}
+		}
+	}
+
+	static void RetainReachableContexts (MarkCrossReferencesArgs* args, HandleContext* context, JniObjectReference reference)
+	{
+		unsafe {
+			// SAFETY: the native host publishes the CLR-owned graph until completion, and the caller
+			// holds ReferenceTrackingHandlesLock while indexing and retaining its contexts.
+			IndexPendingGraph (args);
+			if (!componentByContext.TryGetValue ((IntPtr)context, out nuint start))
+				return;
+
+			var visited = new HashSet<nuint> ();
+			var pending = new Stack<nuint> ();
+			pending.Push (start);
+			while (pending.TryPop (out nuint index)) {
+				if (!visited.Add (index))
+					continue;
+
+				StronglyConnectedComponent component = args->Components [index];
+				for (nuint i = 0; i < component.Count; i++) {
+					HandleContext* reachable = GetContext (component, i);
+					if (!retainedContexts.Add ((IntPtr)reachable))
+						continue;
+
+					if (reachable->PeerReference.Type == JniObjectReferenceType.WeakGlobal) {
+						TakeGlobalReference (reachable, reachable == context ? reference : default);
+						if (reachable->IsCollected)
+							Environment.FailFast ("A peer reachable from an acquired GC bridge peer was collected.");
+					}
+				}
+
+				if (componentDestinations.TryGetValue (index, out List<nuint>? destinations)) {
+					foreach (nuint destination in destinations) {
+						pending.Push (destination);
+					}
+				}
+			}
+		}
+	}
+
+	static void IndexPendingGraph (MarkCrossReferencesArgs* args)
+	{
+		unsafe {
+			// SAFETY: args and its counted arrays remain live until bridge completion under the shared lock.
+			if (indexedArgs == (IntPtr)args)
+				return;
+			if (indexedArgs != IntPtr.Zero)
+				throw new InvalidOperationException ("A different GC bridge graph is already indexed.");
+
+			ValidateArguments (args);
+			for (nuint i = 0; i < args->ComponentCount; i++) {
+				StronglyConnectedComponent component = args->Components [i];
+				for (nuint j = 0; j < component.Count; j++) {
+					componentByContext.Add ((IntPtr)GetContext (component, j), i);
+				}
+			}
+
+			for (nuint i = 0; i < args->CrossReferenceCount; i++) {
+				ComponentCrossReference edge = args->CrossReferences [i];
+				if (edge.SourceGroupIndex >= args->ComponentCount || edge.DestinationGroupIndex >= args->ComponentCount)
+					throw new InvalidOperationException ("A GC bridge cross-reference component index is out of range.");
+				if (!componentDestinations.TryGetValue (edge.SourceGroupIndex, out List<nuint>? destinations)) {
+					destinations = [];
+					componentDestinations.Add (edge.SourceGroupIndex, destinations);
+				}
+				destinations.Add (edge.DestinationGroupIndex);
+			}
+			indexedArgs = (IntPtr)args;
+		}
+	}
+
 	static JavaMarshalGCBridgeJni CreateJni ()
 	{
-		ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.Initialize);
+		var previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.Initialize);
 		try {
 			return new JavaMarshalGCBridgeJni ();
 		} finally {
-			ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
+			ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
 		}
 	}
 
@@ -95,9 +207,6 @@ static class JavaMarshalGCBridge
 				bool gcBridgeEventEnabled = RuntimeFeature.EventSourceSupport && RuntimeEventSource.GCBridgeStart ();
 				HandleContext.EnsureAllContextsAreOurs (args);
 				Process (args);
-				ReadOnlySpan<GCHandle> handlesToFree = ProcessCollectedContexts (args);
-
-				JavaMarshal.FinishCrossReferenceProcessing (args, handlesToFree);
 
 				Interlocked.Increment (ref bridgeProcessingGeneration);
 				// Keep the switch here so ILLink removes the EventSource when it is disabled.
@@ -136,7 +245,9 @@ static class JavaMarshalGCBridge
 					return;
 				}
 
-				GCHandle handle = HandleContext.GetAssociatedGCHandle (context);
+				GCHandle handle = RuntimeFeature.IsCoreClrRuntime
+					? HandleContext.TakeAssociatedGCHandle (context)
+					: HandleContext.GetAssociatedGCHandle (context);
 
 				// Note: modifying the RegisteredInstances dictionary while processing the collected contexts
 				// is tricky and can lead to deadlocks, so we remember which contexts were collected and we will free
@@ -159,12 +270,42 @@ static class JavaMarshalGCBridge
 			if (RuntimeFeature.GCBridgeLogging) {
 				LogArguments (args);
 			}
-			PrepareForJavaCollection (args);
+			if (RuntimeFeature.IsCoreClrRuntime) {
+				lock (HandleContext.ReferenceTrackingHandlesLock) {
+					PrepareForJavaCollection (args);
+				}
+			} else {
+				PrepareForJavaCollection (args);
+			}
 			BridgeJni.TriggerJavaGC ();
+			if (RuntimeFeature.IsCoreClrRuntime) {
+				lock (HandleContext.ReferenceTrackingHandlesLock) {
+					CompleteBridge (args);
+				}
+			} else {
+				CompleteBridge (args);
+			}
+		}
+	}
+
+	static void CompleteBridge (MarkCrossReferencesArgs* args)
+	{
+		unsafe {
+			// SAFETY: the graph remains live until FinishCrossReferenceProcessing; CoreCLR holds the
+			// shared lock until the pending pointer and collected handles can no longer be acquired.
 			CleanupAfterJavaCollection (args);
 			if (RuntimeFeature.GCBridgeLogging) {
 				LogSummary (args);
 			}
+			ReadOnlySpan<GCHandle> handlesToFree = ProcessCollectedContexts (args);
+			if (RuntimeFeature.IsCoreClrRuntime) {
+				ClearPendingBridgeArgs ((IntPtr)args);
+				indexedArgs = IntPtr.Zero;
+				componentByContext.Clear ();
+				componentDestinations.Clear ();
+				retainedContexts.Clear ();
+			}
+			JavaMarshal.FinishCrossReferenceProcessing (args, handlesToFree);
 		}
 	}
 
@@ -310,61 +451,84 @@ static class JavaMarshalGCBridge
 	{
 		unsafe {
 			// SAFETY: the registered context owns global; weak is created before global is released, and failure to create a valid weak reference terminates rather than publishing it.
+			if (RuntimeFeature.IsCoreClrRuntime && retainedContexts.Contains ((IntPtr)context))
+				return;
+
 			JniObjectReference global = context->PeerReference;
 			if (global.Type != JniObjectReferenceType.Global)
 				throw new InvalidOperationException ("Expected a global reference before Java GC bridge processing.");
 
-			ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
+			var previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
 			JniObjectReference weak;
 			try {
 				weak = global.NewWeakGlobalRef ();
 			} finally {
-				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
+				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
 			}
 			if (!weak.IsValid) {
 				FailFastOnPendingJavaException ("Failed to create a weak global reference during GC bridge processing.");
 				Environment.FailFast ("Failed to create a weak global reference during GC bridge processing.");
 			}
 
+			if (RuntimeFeature.IsCoreClrRuntime && retainedContexts.Contains ((IntPtr)context)) {
+				previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
+				try {
+					JniObjectReference.Dispose (ref weak);
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
+				}
+				return;
+			}
+
 			context->SetPeerReference (weak);
-			ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
+			previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.GlobalToWeak);
 			try {
 				JniObjectReference.Dispose (ref global);
 			} finally {
-				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
+				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
 			}
 		}
 	}
 
-	static void TakeGlobalReference (HandleContext* context)
+	static void TakeGlobalReference (HandleContext* context, JniObjectReference strongReference = default)
 	{
 		unsafe {
 			// SAFETY: the registered context owns weak; promotion supplies global or the collected/null result before weak is released, and unexpected JNI failure terminates.
 			JniObjectReference weak = context->PeerReference;
+			if (RuntimeFeature.IsCoreClrRuntime && weak.Type == JniObjectReferenceType.Global && retainedContexts.Contains ((IntPtr)context))
+				return;
 			if (weak.Type != JniObjectReferenceType.WeakGlobal)
 				throw new InvalidOperationException ("Expected a weak global reference after Java GC bridge processing.");
 
-			ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
-			JniObjectReference global;
+			bool trackPromotion = RuntimeFeature.IsCoreClrRuntime;
+			if (trackPromotion && !contextsBeingPromoted.Add ((IntPtr)context))
+				return;
 			try {
-				global = weak.NewGlobalRef ();
-			} finally {
-				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
-			}
-
-			if (!global.IsValid) {
-				FailFastOnPendingJavaException ("Failed to promote a weak global reference during GC bridge processing.");
-				if (RuntimeFeature.EventSourceSupport) {
-					RuntimeEventSource.WeakGlobalReferenceCollected (weak.Handle);
+				var previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
+				JniObjectReference global;
+				try {
+					global = (strongReference.IsValid ? strongReference : weak).NewGlobalRef ();
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
 				}
-			}
 
-			context->SetPeerReference (global);
-			ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
-			try {
-				JniObjectReference.Dispose (ref weak);
+				if (!global.IsValid) {
+					FailFastOnPendingJavaException ("Failed to promote a weak global reference during GC bridge processing.");
+					if (RuntimeFeature.EventSourceSupport) {
+						RuntimeEventSource.WeakGlobalReferenceCollected (weak.Handle);
+					}
+				}
+
+				context->SetPeerReference (global);
+				previousOperation = ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
+				try {
+					JniObjectReference.Dispose (ref weak);
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation (previousOperation);
+				}
 			} finally {
-				ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
+				if (trackPromotion)
+					contextsBeingPromoted.Remove ((IntPtr)context);
 			}
 		}
 	}

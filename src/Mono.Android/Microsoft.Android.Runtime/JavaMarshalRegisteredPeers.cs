@@ -172,6 +172,13 @@ static class JavaMarshalRegisteredPeers
 				return null;
 
 			for (int i = peers.Count - 1; i >= 0; i--) {
+				if (RuntimeFeature.IsCoreClrRuntime &&
+						(reference.Type == JniObjectReferenceType.Local || reference.Type == JniObjectReferenceType.Global)) {
+					if (peers [i].AcquirePeer (reference) is IJavaPeerable acquired)
+						return acquired;
+					continue;
+				}
+
 				if (peers [i].Target is IJavaPeerable peer
 					&& JniEnvironment.Types.IsSameObject (reference, peer.PeerReference))
 				{
@@ -350,6 +357,14 @@ static class JavaMarshalRegisteredPeers
 
 		public IJavaPeerable? Target
 			=> _weakReference.TryGetTarget (out var target) ? target : null;
+
+		public IJavaPeerable? AcquirePeer (JniObjectReference reference)
+		{
+			unsafe {
+				// SAFETY: the registry lock retains this context while the bridge acquires its target.
+				return JavaMarshalGCBridge.TryAcquirePeer (_context, reference);
+			}
+		}
 
 		// SAFETY: this only tests the stored context address; no context memory is accessed.
 		public bool IsValid => unsafe(_context != null);

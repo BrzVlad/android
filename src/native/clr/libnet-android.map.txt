@@ -3,6 +3,9 @@ LIBNET_ANDROID {
     JNI_OnLoad;
     Java_mono_android_Runtime_initInternal;
     Java_mono_android_Runtime_propagateUncaughtException;
+    android_get_pending_gc_bridge_args;
+    android_clear_pending_gc_bridge_args;
+    android_get_gc_bridge_reference_type;
 
   local:
     *;

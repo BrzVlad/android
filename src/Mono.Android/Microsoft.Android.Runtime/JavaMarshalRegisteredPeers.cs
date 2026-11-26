@@ -167,11 +167,25 @@ static class JavaMarshalRegisteredPeers
 
 		int key = JniEnvironment.References.GetIdentityHashCode (reference);
 
+		// During bridge processing, acquire the peer without waiting instead of reading the WeakReference,
+		// which would wait for the bridge to finish.
+		bool canAcquire = true;
+
 		lock (s_instancesLock) {
 			if (!RegisteredInstances.TryGetValue (key, out RegisteredPeerBucket peers))
 				return null;
 
 			for (int i = peers.Count - 1; i >= 0; i--) {
+				if (canAcquire && JavaMarshalGCBridge.IsBridgeProcessingActive) {
+					if (peers [i].TryAcquirePeer (reference, out IJavaPeerable? acquired)) {
+						if (acquired != null)
+							return acquired;
+						continue;
+					}
+					// The round finished meanwhile, or the object could not be held strongly; use the regular path.
+					canAcquire = false;
+				}
+
 				if (peers [i].Target is IJavaPeerable peer
 					&& JniEnvironment.Types.IsSameObject (reference, peer.PeerReference))
 				{
@@ -350,6 +364,15 @@ static class JavaMarshalRegisteredPeers
 
 		public IJavaPeerable? Target
 			=> _weakReference.TryGetTarget (out var target) ? target : null;
+
+		/// <summary>
+		/// During bridge processing, returns the peer for <paramref name="reference"/> without waiting and keeps
+		/// it alive for the rest of the round.
+		/// </summary>
+		/// <returns><c>false</c> if no bridge round is active.</returns>
+		public bool TryAcquirePeer (JniObjectReference reference, out IJavaPeerable? peer)
+			// SAFETY: this owner retains the registered context; the caller passes a live JNI reference.
+			=> unsafe(JavaMarshalGCBridge.TryAcquirePeer (_context, reference, out peer));
 
 		// SAFETY: this only tests the stored context address; no context memory is accessed.
 		public bool IsValid => unsafe(_context != null);

@@ -34,7 +34,74 @@ static class JavaMarshalGCBridge
 	static int bridgeProcessingGeneration;
 	static readonly Lazy<JavaMarshalGCBridgeJni> jni = new (CreateJni);
 
+	// Contexts forced alive by a `PeekPeer` lookup for the rest of the current bridge round. Also used as the lock
+	// that protects its elements, the processingActive flag and the Java references within the contexts.
+	static readonly HashSet<IntPtr> acquiredContexts = new ();
+	// Native flag set by the GC bridge callback while the world is stopped.
+	static int* processingActive;
+
 	internal static int BridgeProcessingGeneration => Volatile.Read (ref bridgeProcessingGeneration);
+
+	internal static bool IsBridgeProcessingActive {
+		get {
+			unsafe {
+				// SAFETY: the native host owns the flag for the process lifetime.
+				int* flag = processingActive;
+				return flag != null && Volatile.Read (ref *flag) != 0;
+			}
+		}
+	}
+
+	/// <summary>
+	/// Makes the Java reference of a peer strong for the rest of the current bridge round, so the bridge
+	/// neither demotes it nor reports the peer as collected.
+	/// </summary>
+	/// <returns>
+	/// <c>false</c> if no bridge round is active or no strong reference to the object could be obtained, in
+	/// which case nothing was done. Otherwise <c>true</c>, with <paramref name="peer"/> set when
+	/// <paramref name="context"/> belongs to <paramref name="reference"/>.
+	/// </returns>
+	/// <safety>
+	/// <paramref name="context"/> must be registered. <paramref name="reference"/> must be a live JNI reference
+	/// of any kind.
+	/// </safety>
+	internal static unsafe bool TryAcquirePeer (HandleContext* context, JniObjectReference reference, out IJavaPeerable? peer)
+	{
+		peer = null;
+		lock (acquiredContexts) {
+			if (!IsBridgeProcessingActive)
+				return false;
+
+			unsafe {
+				// SAFETY: the registry retains the context; the lock excludes the bridge's reference transitions and handle release.
+				IJavaPeerable? target = HandleContext.GetTargetUnsafe (context);
+				JniObjectReference current = context->PeerReference;
+				if (target == null || !current.IsValid || !JniEnvironment.Types.IsSameObject (reference, current))
+					return true;
+
+				// Raw handles from bindings carry no reference type, and a weak one may be cleared. A new global
+				// reference both proves the object is alive and keeps it alive.
+				ManagedObjectReferenceManager.BeginGCBridgeReferenceOperation (GCBridgeReferenceOperation.WeakToGlobal);
+				try {
+					JniObjectReference strong = reference.NewGlobalRef ();
+					if (!strong.IsValid)
+						return false;
+
+					if (current.Type == JniObjectReferenceType.WeakGlobal) {
+						context->SetPeerReference (strong);
+						JniObjectReference.Dispose (ref current);
+					} else {
+						JniObjectReference.Dispose (ref strong);
+					}
+				} finally {
+					ManagedObjectReferenceManager.EndGCBridgeReferenceOperation ();
+				}
+				acquiredContexts.Add ((IntPtr) context);
+				peer = target;
+				return true;
+			}
+		}
+	}
 
 	static JavaMarshalGCBridgeJni BridgeJni
 		=> jni.Value;
@@ -67,11 +134,14 @@ static class JavaMarshalGCBridge
 				// SAFETY: the host retains the initializer and ProcessBridge for the process lifetime; the lock and guard prevent duplicate initialization.
 				var initializeGCBridge = args.initializeGCBridge;
 				ArgumentNullException.ThrowIfNull (initializeGCBridge);
+				if (args.gcBridgeProcessingActive == IntPtr.Zero)
+					throw new InvalidOperationException ("The native GC bridge processing flag was not provided.");
 
 				if (RuntimeFeature.EventSourceSupport) {
 					RuntimeEventSource.Initialize ();
 				}
 
+				processingActive = (int*) args.gcBridgeProcessingActive;
 				var mark_cross_references_ftn = initializeGCBridge (&ProcessBridge);
 				if (mark_cross_references_ftn == null)
 					throw new InvalidOperationException ("The native GC bridge initializer did not return a bridge callback.");
@@ -95,7 +165,14 @@ static class JavaMarshalGCBridge
 				bool gcBridgeEventEnabled = RuntimeFeature.EventSourceSupport && RuntimeEventSource.GCBridgeStart ();
 				HandleContext.EnsureAllContextsAreOurs (args);
 				Process (args);
-				ReadOnlySpan<GCHandle> handlesToFree = ProcessCollectedContexts (args);
+				ReadOnlySpan<GCHandle> handlesToFree;
+				lock (acquiredContexts) {
+					handlesToFree = ProcessCollectedContexts (args);
+					acquiredContexts.Clear ();
+					// From here on peers are no longer demoted or reported dead in this round, so lookups
+					// return to the regular path, which waits only until FinishCrossReferenceProcessing.
+					Volatile.Write (ref *processingActive, 0);
+				}
 
 				JavaMarshal.FinishCrossReferenceProcessing (args, handlesToFree);
 
@@ -159,9 +236,14 @@ static class JavaMarshalGCBridge
 			if (RuntimeFeature.GCBridgeLogging) {
 				LogArguments (args);
 			}
-			PrepareForJavaCollection (args);
+			lock (acquiredContexts) {
+				PrepareForJavaCollection (args);
+			}
+			// Lookups may acquire peers while Java collects; they promote the caller's strong reference.
 			BridgeJni.TriggerJavaGC ();
-			CleanupAfterJavaCollection (args);
+			lock (acquiredContexts) {
+				CleanupAfterJavaCollection (args);
+			}
 			if (RuntimeFeature.GCBridgeLogging) {
 				LogSummary (args);
 			}
@@ -311,6 +393,8 @@ static class JavaMarshalGCBridge
 		unsafe {
 			// SAFETY: the registered context owns global; weak is created before global is released, and failure to create a valid weak reference terminates rather than publishing it.
 			JniObjectReference global = context->PeerReference;
+			if (acquiredContexts.Contains ((IntPtr) context))
+				return;
 			if (global.Type != JniObjectReferenceType.Global)
 				throw new InvalidOperationException ("Expected a global reference before Java GC bridge processing.");
 
@@ -341,6 +425,8 @@ static class JavaMarshalGCBridge
 		unsafe {
 			// SAFETY: the registered context owns weak; promotion supplies global or the collected/null result before weak is released, and unexpected JNI failure terminates.
 			JniObjectReference weak = context->PeerReference;
+			if (acquiredContexts.Contains ((IntPtr) context))
+				return;
 			if (weak.Type != JniObjectReferenceType.WeakGlobal)
 				throw new InvalidOperationException ("Expected a weak global reference after Java GC bridge processing.");
 

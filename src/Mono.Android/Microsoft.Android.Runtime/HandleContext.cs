@@ -98,6 +98,20 @@ internal struct HandleContext
 		}
 	}
 
+	/// <summary>
+	/// Reads the peer through its crossreference handle. Unlike a <see cref="WeakReference{T}"/> read,
+	/// this does not wait for bridge processing, so it can return a peer that the bridge is about to
+	/// report as collected.
+	/// </summary>
+	public static IJavaPeerable? GetTargetUnsafe (HandleContext* context)
+	{
+		lock (referenceTrackingHandles) {
+			return referenceTrackingHandles.TryGetValue ((IntPtr) context, out GCHandle handle)
+				? handle.Target as IJavaPeerable
+				: null;
+		}
+	}
+
 	/// <safety>
 	/// <paramref name="mcr"/> must address the CLR bridge's live descriptor and correctly bounded
 	/// component/context arrays for the entire callback. Checking registry membership does not validate native memory.

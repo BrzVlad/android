@@ -33,6 +33,7 @@ namespace Android.Runtime
 			public safe IntPtr          propagateUncaughtExceptionFn;
 			public safe int             maxGrefCount;
 			public safe delegate* unmanaged<delegate* unmanaged<MarkCrossReferencesArgs*, void>, delegate* unmanaged<MarkCrossReferencesArgs*, void>> initializeGCBridge;
+			public safe IntPtr          gcBridgeProcessingActive;
 		}
 #pragma warning restore 0649
 

@@ -144,6 +144,7 @@ extern "C" void NativeAOT_OnInit (JNIEnv *env, jstring language, jstring filesDi
 	initArgs->grefGcThreshold = static_cast<int>(AndroidSystem::get_gref_gc_threshold ());
 	initArgs->maxGrefCount = static_cast<int>(AndroidSystem::get_max_gref_count ());
 	initArgs->initializeGCBridge = &GCBridge::initialize_callback;
+	initArgs->gcBridgeProcessingActive = GCBridge::get_processing_active_flag ();
 	initArgs->grefIGCUserPeer = create_igc_user_peer_global_ref (env);
 	initArgs->jniRemappingData = load_nativeaot_remapping ();
 }

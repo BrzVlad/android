@@ -52,6 +52,8 @@ void GCBridge::mark_cross_references (MarkCrossReferencesArgs *args) noexcept
 	abort_unless (args->Components != nullptr || args->ComponentCount == 0, "Components must not be null if ComponentCount is greater than 0");
 	abort_unless (args->CrossReferences != nullptr || args->CrossReferenceCount == 0, "CrossReferences must not be null if CrossReferenceCount is greater than 0");
 
+	// The GC resumes the world after this callback, making the value visible to the managed consumers.
+	__atomic_store_n (&processing_active, 1u, __ATOMIC_RELAXED);
 	publish_shared_args (args);
 }
 

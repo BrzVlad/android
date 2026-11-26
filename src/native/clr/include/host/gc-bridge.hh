@@ -58,7 +58,15 @@ namespace xamarin::android {
 			return mark_cross_references;
 		}
 
+		// Managed code reads this flag to detect an active bridge round and clears it once the
+		// round no longer modifies peer references.
+		static uint32_t* get_processing_active_flag () noexcept
+		{
+			return &processing_active;
+		}
+
 	private:
+		static inline uint32_t processing_active = 0;
 		static inline sem_t shared_args_semaphore {};
 		// JavaMarshal serializes bridge rounds: it does not publish another argument block until
 		// FinishCrossReferenceProcessing has completed. This is therefore a single-slot handoff;

@@ -28,10 +28,13 @@ namespace xamarin::android {
 		jnienv_propagate_uncaught_exception_fn propagateUncaughtExceptionFn;
 		int              maxGrefCount;
 		jnienv_initialize_gc_bridge_fn initializeGCBridge;
+		// Nonzero from the GC bridge callback until managed bridge processing has finished the round.
+		uint32_t       *gcBridgeProcessingActive;
 	};
 
 	static_assert (offsetof (JnienvInitializeArgs, initializeGCBridge) == (sizeof (void*) == 8 ? 80 : 48));
-	static_assert (sizeof (JnienvInitializeArgs) == (sizeof (void*) == 8 ? 88 : 52));
+	static_assert (offsetof (JnienvInitializeArgs, gcBridgeProcessingActive) == (sizeof (void*) == 8 ? 88 : 52));
+	static_assert (sizeof (JnienvInitializeArgs) == (sizeof (void*) == 8 ? 96 : 56));
 
 	// Keep the enum values in sync with those in src/Mono.Android/AndroidRuntime/BoundExceptionType.cs
 	enum class BoundExceptionType : uint8_t
